@@ -614,7 +614,13 @@ void tcprcvwin(struct conv *s)
 
 	tcb = (Tcpctl *) s->ptcl;
 	w = tcb->window - qlen(s->rq);
-	if (w < 0)
+	/* Keep in mind that tcb->window - qlen can be < 0.
+	 *
+	 * If our real window is < mss, we'll advertise 0.  This should avoid the
+	 * Silly Window Syndrome (RFC 813 and 1122) by not advertising a small
+	 * buffer, where small is < MSS.  It will also help buggy TCP senders, such
+	 * as qemu, that treat rcv.win < MSS as a stop condition. */
+	if (w < tcb->mss)
 		w = 0;
 	tcb->rcv.wnd = w;
 	if (w == 0)
@@ -2553,8 +2559,11 @@ void tcpoutput(struct conv *s)
 		tcb->flags &= ~FORCE;
 		tcprcvwin(s);
 
-		/* By default we will generate an ack */
-		tcphalt(tpriv, &tcb->acktimer);
+		/* By default we will generate an ack, so we can normally turn off the
+		 * timer.  If we're blocked, we'll want the timer so we can send a
+		 * window update. */
+		if (!tcb->rcv.blocked)
+			tcphalt(tpriv, &tcb->acktimer);
 		tcb->rcv.una = 0;
 		seg.source = s->lport;
 		seg.dest = s->rport;
