@@ -92,10 +92,13 @@ enum {
 	WS_LENGTH = 3,	/* WS header option length */
 	TS_OPT = 8,
 	TS_LENGTH = 10,
+	SACK_OK_OPT = 4,
+	SACK_OK_LENGTH = 2,
 	MSL2 = 10,
 	MSPTICK = 50,	/* Milliseconds per timer tick */
 	DEF_MSS = 1460,	/* Default mean segment */
 	DEF_MSS6 = 1280,	/* Default mean segment (min) for v6 */
+	SACK_SUPPORTED = TRUE,	/* SACK is on by default */
 	DEF_RTT = 500,	/* Default round trip */
 	DEF_KAT = 120000,	/* Default time (ms) between keep alives */
 	TCP_LISTEN = 0,	/* Listen connection */
@@ -220,6 +223,7 @@ struct Tcp {
 	uint16_t len;				/* size of data */
 	uint32_t ts_val;			/* timestamp val from sender */
 	uint32_t ts_ecr;			/* timestamp echo response from sender */
+	bool sack_ok;				/* header had/should have SACK_PERMITTED */
 };
 
 /*
@@ -292,6 +296,7 @@ struct Tcpctl {
 	int flgcnt;					/* number of flags in the sequence (FIN,SEQ) */
 	uint32_t ts_recent;			/* timestamp received around last_ack_sent */
 	uint32_t last_ack_sent;		/* to determine when to update timestamp */
+	bool sack_ok;				/* Can use SACK for this connection */
 
 	union {
 		Tcp4hdr tcp4hdr;
@@ -328,6 +333,7 @@ struct Limbo {
 	uint64_t lastsend;			/* last time we sent a synack */
 	uint8_t version;			/* v4 or v6 */
 	uint8_t rexmits;			/* number of retransmissions */
+	bool sack_ok;				/* other side said SACK_OK */
 	uint32_t ts_val;			/* timestamp val from sender */
 };
 
@@ -998,6 +1004,8 @@ static void compute_hdrlen_optpad(Tcp *tcph, uint16_t default_hdrlen,
 			hdrlen += MSS_LENGTH;
 		if (tcph->ws)
 			hdrlen += WS_LENGTH;
+		if (tcph->sack_ok)
+			hdrlen += SACK_OK_LENGTH;
 	}
 	if (tcp_seg_has_ts(tcph))
 		hdrlen += TS_LENGTH;
@@ -1023,6 +1031,10 @@ static void write_opts(Tcp *tcph, uint8_t *opt, uint16_t optpad)
 			*opt++ = WSOPT;
 			*opt++ = WS_LENGTH;
 			*opt++ = tcph->ws;
+		}
+		if (tcph->sack_ok) {
+			*opt++ = SACK_OK_OPT;
+			*opt++ = SACK_OK_LENGTH;
 		}
 	}
 	if (tcp_seg_has_ts(tcph)) {
@@ -1174,6 +1186,10 @@ static void parse_inbound_opts(Tcp *tcph, uint8_t *opt, uint16_t optsize)
 				if (optlen == WS_LENGTH && *(opt + 2) <= 14)
 					tcph->ws = HaveWS | *(opt + 2);
 				break;
+			case SACK_OK_OPT:
+				if (optlen == SACK_OK_LENGTH)
+					tcph->sack_ok = TRUE;
+				break;
 			case TS_OPT:
 				if (optlen == TS_LENGTH) {
 					tcph->ts_val = nhgetl(opt + 2);
@@ -1184,6 +1200,17 @@ static void parse_inbound_opts(Tcp *tcph, uint8_t *opt, uint16_t optsize)
 		optsize -= optlen;
 		opt += optlen;
 	}
+}
+
+/* Helper, clears the opts.  We'll later set them with e.g. parse_inbound_opts,
+ * set them manually, or something else. */
+static void clear_tcph_opts(Tcp *tcph)
+{
+	tcph->mss = 0;
+	tcph->ws = 0;
+	tcph->sack_ok = FALSE;
+	tcph->ts_val = 0;
+	tcph->ts_ecr = 0;
 }
 
 int ntohtcp6(Tcp * tcph, struct block **bpp)
@@ -1209,10 +1236,7 @@ int ntohtcp6(Tcp * tcph, struct block **bpp)
 	tcph->flags = h->tcpflag[1];
 	tcph->wnd = nhgets(h->tcpwin);
 	tcph->urg = nhgets(h->tcpurg);
-	tcph->mss = 0;
-	tcph->ws = 0;
-	tcph->ts_val = 0;
-	tcph->ts_ecr = 0;
+	clear_tcph_opts(tcph);
 	tcph->len = nhgets(h->ploadlen) - hdrlen;
 
 	*bpp = pullupblock(*bpp, hdrlen + TCP6_PKT);
@@ -1246,10 +1270,7 @@ int ntohtcp4(Tcp * tcph, struct block **bpp)
 	tcph->flags = h->tcpflag[1];
 	tcph->wnd = nhgets(h->tcpwin);
 	tcph->urg = nhgets(h->tcpurg);
-	tcph->mss = 0;
-	tcph->ws = 0;
-	tcph->ts_val = 0;
-	tcph->ts_ecr = 0;
+	clear_tcph_opts(tcph);
 	tcph->len = nhgets(h->length) - (hdrlen + TCP4_PKT);
 
 	*bpp = pullupblock(*bpp, hdrlen + TCP4_PKT);
@@ -1345,6 +1366,7 @@ sndrst(struct Proto *tcp, uint8_t * source, uint8_t * dest,
 	seg->urg = 0;
 	seg->mss = 0;
 	seg->ws = 0;
+	seg->sack_ok = FALSE;
 	/* seg->ts_val is already set with their timestamp */
 	switch (version) {
 		case V4:
@@ -1388,6 +1410,7 @@ static void tcphangup(struct conv *s)
 			seg.urg = 0;
 			seg.mss = 0;
 			seg.ws = 0;
+			seg.sack_ok = FALSE;
 			seg.ts_val = tcb->ts_recent;
 			switch (s->ipversion) {
 				case V4:
@@ -1463,6 +1486,10 @@ int sndsynack(struct Proto *tcp, Limbo * lp)
 		seg.ws = 0;
 		lp->sndscale = 0;
 	}
+	if (SACK_SUPPORTED)
+		seg.sack_ok = lp->sack_ok;
+	else
+		seg.sack_ok = FALSE;
 
 	switch (lp->version) {
 		case V4:
@@ -1535,6 +1562,7 @@ limbo(struct conv *s, uint8_t * source, uint8_t * dest, Tcp * seg, int version)
 		lp->rport = seg->source;
 		lp->mss = seg->mss;
 		lp->rcvscale = seg->ws;
+		lp->sack_ok = seg->sack_ok;
 		lp->irs = seg->seq;
 		lp->ts_val = seg->ts_val;
 		urandom_read(&lp->iss, sizeof(lp->iss));
@@ -1736,6 +1764,11 @@ static struct conv *tcpincoming(struct conv *s, Tcp * segp, uint8_t * src,
 	}
 	adjust_typical_mss_for_opts(segp, tcb);
 
+	/* Here's where we record the previously-decided header options.  They were
+	 * actually decided on when we agreed to them in the SYNACK we sent.  We
+	 * didn't create an actual TCB until now, so we can copy those decisions out
+	 * of the limbo tracker and into the TCB. */
+	tcb->sack_ok = lp->sack_ok;
 	/* window scaling */
 	tcpsetscale(new, tcb, lp->rcvscale, lp->sndscale);
 
@@ -2228,7 +2261,11 @@ reset:
 					update(s, &seg);
 					tcpsynackrtt(s);
 					tcpsetstate(s, Established);
+					/* Here's where we get the results of header option
+					 * negotiations for connections we started. (SYNACK has the
+					 * response) */
 					tcpsetscale(s, tcb, seg.ws, tcb->scale);
+					tcb->sack_ok = seg.sack_ok;
 				} else {
 					sndrst(tcp, source, dest, length, &seg, version,
 						   "Got SYN with no ACK");
@@ -2642,13 +2679,20 @@ void tcpoutput(struct conv *s)
 		seg.flags = ACK;
 		seg.mss = 0;
 		seg.ws = 0;
+		seg.sack_ok = FALSE;
+		/* When outputting, Syn_sent means "send the Syn", for connections we
+		 * initiate.  SYNACKs are sent from sndsynack directly. */
 		if (tcb->state == Syn_sent) {
 			seg.flags = 0;
+			seg.sack_ok = SACK_SUPPORTED;	/* here's where we advertise SACK */
 			if (tcb->snd.ptr == tcb->iss) {
 				seg.flags |= SYN;
 				dsize--;
 				seg.mss = tcb->mss;
 				seg.ws = tcb->scale;
+			} else {
+				/* TODO: Not sure why we'd get here. */
+				warn("TCP: weird Syn_sent state, tell someone you saw this");
 			}
 		}
 		seg.seq = tcb->snd.ptr;
@@ -2778,6 +2822,7 @@ void tcpsendka(struct conv *s)
 	seg.flags = ACK | PSH;
 	seg.mss = 0;
 	seg.ws = 0;
+	seg.sack_ok = FALSE;
 	if (tcpporthogdefense)
 		urandom_read(&seg.seq, sizeof(seg.seq));
 	else
