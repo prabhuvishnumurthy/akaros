@@ -90,6 +90,7 @@ enum {
 	MSS_LENGTH = 4,	/* max segment size header option length */
 	WSOPT = 3,
 	WS_LENGTH = 3,	/* WS header option length */
+	MAX_WS_VALUE = 14,	/* RFC specified.  Limits available window to 2^30 */
 	TS_OPT = 8,
 	TS_LENGTH = 10,
 	SACK_OK_OPT = 4,
@@ -1183,7 +1184,7 @@ static void parse_inbound_opts(Tcp *tcph, uint8_t *opt, uint16_t optsize)
 					tcph->mss = nhgets(opt + 2);
 				break;
 			case WSOPT:
-				if (optlen == WS_LENGTH && *(opt + 2) <= 14)
+				if (optlen == WS_LENGTH && *(opt + 2) <= MAX_WS_VALUE)
 					tcph->ws = HaveWS | *(opt + 2);
 				break;
 			case SACK_OK_OPT:
